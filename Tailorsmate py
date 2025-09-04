@@ -1,0 +1,212 @@
+import os
+import json
+import io
+import cv2
+import numpy as np
+from mediapipe.python.solutions import pose as mp_pose
+from PIL import Image, ImageDraw
+import requests
+import base64
+import psycopg2
+from psycopg2 import extras
+from datetime import datetime, timezone
+import hmac
+import hashlib
+
+# Flask imports
+from flask import Flask, request, jsonify, abort
+
+# S3-compatible storage client (e.g., boto3 for AWS S3, or compatible services)
+import boto3
+from botocore.exceptions import ClientError
+
+# Payment Gateway SDKs
+import stripe
+import razorpay
+
+# --- Flask App Initialization ---
+app = Flask(__name__)
+
+# --- Configuration from Environment Variables ---
+DATABASE_URL = os.environ.get("DATABASE_URL")
+S3_ENDPOINT_URL = os.environ.get("S3_ENDPOINT_URL") # e.g., 'https://s3.your-region.amazonaws.com' or 'https://nyc3.digitaloceanspaces.com'
+S3_ACCESS_KEY_ID = os.environ.get("S3_ACCESS_KEY_ID")
+S3_SECRET_ACCESS_KEY = os.environ.get("S3_SECRET_ACCESS_KEY")
+S3_BUCKET_NAME = os.environ.get("S3_BUCKET_NAME") # Main bucket for customer_uploads and sketches
+
+STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY")
+STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET")
+RAZORPAY_KEY_ID = os.environ.get("RAZORPAY_KEY_ID")
+RAZORPAY_KEY_SECRET = os.environ.get("RAZORPAY_KEY_SECRET")
+RAZORPAY_WEBHOOK_SECRET = os.environ.get("RAZORPAY_WEBHOOK_SECRET")
+
+DELHIVERY_API_KEY = os.environ.get("DELHIVERY_API_KEY")
+DHL_API_KEY = os.environ.get("DHL_API_KEY")
+DHL_ACCOUNT_NUMBER = os.environ.get("DHL_ACCOUNT_NUMBER")
+
+AI_SD_API_ENDPOINT = os.environ.get('AI_SD_API_ENDPOINT', 'YOUR_STABLE_DIFFUSION_API_ENDPOINT')
+AI_SD_API_KEY = os.environ.get('AI_SD_API_KEY', 'YOUR_STABLE_DIFFUSION_API_KEY') # If your SD API needs a key
+
+# Initialize SDKs
+stripe.api_key = STRIPE_SECRET_KEY
+razorpay_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
+
+s3_client = boto3.client(
+    's3',
+    endpoint_url=S3_ENDPOINT_URL,
+    aws_access_key_id=S3_ACCESS_KEY_ID,
+    aws_secret_access_key=S3_SECRET_ACCESS_KEY
+)
+
+# --- Database Connection Helper ---
+def get_db_connection():
+    conn = psycopg2.connect(DATABASE_URL)
+    return conn
+
+# --- Helper for Notifications ---
+def send_notification(user_id, message, notification_type, order_id=None):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "INSERT INTO notifications (user_id, order_id, message, type) VALUES (%s, %s, %s, %s)",
+            (user_id, order_id, message, notification_type)
+        )
+        conn.commit()
+    except Exception as e:
+        print(f"Error sending notification: {e}")
+    finally:
+        cur.close()
+        conn.close()
+
+# --- BodyAnalyzer and SketchGenerator Classes (from previous response) ---
+# (Paste the BodyAnalyzer and SketchGenerator classes here,
+#  making sure BodyAnalyzer.analyze_body accepts image_bytes directly)
+
+class BodyAnalyzer:
+    def __init__(self):
+        self.mp_pose = mp_pose.Pose(static_image_mode=True, min_detection_confidence=0.5)
+        self.pose_landmarks = mp_pose.PoseLandmark
+
+    def _calculate_distance_pixels(self, p1, p2, image_width, image_height):
+        x1, y1 = p1.x * image_width, p1.y * image_height
+        x2, y2 = p2.x * image_width, p2.y * image_height
+        return np.sqrt((x2 - x1)**2 + (y2 - y1)**2)
+
+    def analyze_body(self, image_bytes, age_group='adult'): # Accepts image bytes directly
+        np_arr = np.frombuffer(image_bytes, np.uint8)
+        image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+
+        if image is None:
+            raise ValueError("Could not decode image bytes.")
+        
+        max_dim = 800
+        h, w, _ = image.shape
+        if max(h, w) > max_dim:
+            scale = max_dim / max(h, w)
+            image = cv2.resize(image, (int(w * scale), int(h * scale)))
+
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        results = self.mp_pose.process(image_rgb)
+
+        measurements = {}
+        body_type = "unknown"
+
+        if results.pose_landmarks:
+            landmarks = results.pose_landmarks.landmark
+            img_h, img_w, _ = image.shape
+
+            left_shoulder = landmarks[self.pose_landmarks.LEFT_SHOULDER]
+            right_shoulder = landmarks[self.pose_landmarks.RIGHT_SHOULDER]
+            measurements['shoulders_width_ratio'] = self._calculate_distance_pixels(left_shoulder, right_shoulder, img_w, img_h) / img_h
+
+            left_hip = landmarks[self.pose_landmarks.LEFT_HIP]
+            right_hip = landmarks[self.pose_landmarks.RIGHT_HIP]
+            measurements['hips_width_ratio'] = self._calculate_distance_pixels(left_hip, right_hip, img_w, img_h) / img_h
+            
+            measurements['waist_width_ratio'] = measurements['hips_width_ratio'] * 0.85 # Heuristic
+
+            left_arm_length = self._calculate_distance_pixels(left_shoulder, landmarks[self.pose_landmarks.LEFT_WRIST], img_w, img_h)
+            right_arm_length = self._calculate_distance_pixels(right_shoulder, landmarks[self.pose_landmarks.RIGHT_WRIST], img_w, img_h)
+            measurements['arms_length_ratio'] = (left_arm_length + right_arm_length) / (2 * img_h)
+
+            left_hip_lm = landmarks[self.pose_landmarks.LEFT_HIP] # Re-get as landmark objects
+            right_hip_lm = landmarks[self.pose_landmarks.RIGHT_HIP]
+            left_leg_length = self._calculate_distance_pixels(left_hip_lm, landmarks[self.pose_landmarks.LEFT_ANKLE], img_w, img_h)
+            right_leg_length = self._calculate_distance_pixels(right_hip_lm, landmarks[self.pose_landmarks.RIGHT_ANKLE], img_w, img_h)
+            measurements['legs_length_ratio'] = (left_leg_length + right_leg_length) / (2 * img_h)
+            
+            nose = landmarks[self.pose_landmarks.NOSE]
+            left_foot = landmarks[self.pose_landmarks.LEFT_FOOT_INDEX]
+            right_foot = landmarks[self.pose_landmarks.RIGHT_FOOT_INDEX]
+            lowest_foot_y = max(left_foot.y, right_foot.y)
+            measurements['relative_height'] = (lowest_foot_y - nose.y) if lowest_foot_y > nose.y else 0.0
+
+            # --- Age-Group Specific Adjustments and Body Type ---
+            if age_group == 'child':
+                body_type = "child_average_build"
+                if measurements['shoulders_width_ratio'] < 0.2: body_type = "child_slim_build"
+                elif measurements['shoulders_width_ratio'] > 0.35: body_type = "child_sturdy_build"
+                measurements['waist_width_ratio'] *= 1.1 
+            
+            elif age_group == 'elderly':
+                shoulder_to_hip_ratio = measurements['shoulders_width_ratio'] / measurements['hips_width_ratio'] if measurements['hips_width_ratio'] else 1
+                body_type = "elderly_rectangle"
+
+                if shoulder_to_hip_ratio > 1.15: body_type = "elderly_inverted_triangle"
+                elif shoulder_to_hip_ratio < 0.85: body_type = "elderly_pear"
+                elif measurements['waist_width_ratio'] > measurements['hips_width_ratio'] * 0.9: body_type = "elderly_apple"
+                elif measurements['waist_width_ratio'] < measurements['hips_width_ratio'] * 0.8: body_type = "elderly_hourglass"
+                
+                measurements['waist_width_ratio'] *= 1.05
+                measurements['hips_width_ratio'] *= 1.02
+                
+            else: # 'adult' or default
+                shoulder_to_hip_ratio = measurements['shoulders_width_ratio'] / measurements['hips_width_ratio'] if measurements['hips_width_ratio'] else 1
+
+                if shoulder_to_hip_ratio > 1.2: body_type = "inverted triangle"
+                elif shoulder_to_hip_ratio < 0.8: body_type = "pear"
+                elif 0.9 < shoulder_to_hip_ratio < 1.1 and measurements['waist_width_ratio'] > measurements['hips_width_ratio'] * 0.95:
+                    body_type = "apple"
+                elif 0.9 < shoulder_to_hip_ratio < 1.1 and measurements['waist_width_ratio'] < measurements['hips_width_ratio'] * 0.8:
+                    body_type = "hourglass" if abs(measurements['shoulders_width_ratio'] - measurements['hips_width_ratio']) < 0.1 * measurements['shoulders_width_ratio'] else "rectangle"
+                else: body_type = "rectangle"
+
+        return measurements, body_type
+
+class SketchGenerator:
+    def __init__(self, sd_api_endpoint, sd_api_key):
+        self.sd_api_endpoint = sd_api_endpoint
+        self.sd_api_key = sd_api_key
+
+    def generate_prompt(self, body_type, measurements, style, occasion, color, fabric=None, age_group='adult'):
+        age_descriptor = ""
+        if age_group == 'child':
+            age_descriptor = "child-like figure, young, cute, "
+            body_type_desc = body_type.replace("child_", "").replace("_build", "") + " build"
+            prompt = f"line art outline sketch of a {age_descriptor}{body_type_desc}, "
+            prompt += f"wearing a {color} colored, comfortable {style} outfit, suitable for {occasion}. "
+            if fabric:
+                prompt += f"Made of {fabric}. "
+            prompt += "minimal shading, simple, flat, clean fashion design sketch, full body, white background."
+        elif age_group == 'elderly':
+            age_descriptor = "elderly person, graceful, "
+            body_type_desc = body_type.replace("elderly_", "")
+            prompt = f"line art outline sketch of an {age_descriptor}{body_type_desc} body type, "
+            prompt += f"wearing a {color} colored, elegant {style} outfit, suitable for {occasion}. "
+            if fabric:
+                prompt += f"Made of {fabric}. "
+            prompt += "comfortable, loose fit, minimal shading, professional fashion design sketch, full body, white background."
+        else: # Adult
+            body_type_desc = body_type
+            prompt = f"line art outline sketch of a person with {body_type_desc}, "
+            prompt += f"wearing a {color} colored {style} outfit, suitable for a {occasion}. "
+            if fabric:
+                prompt += f"Made of {fabric}. "
+            prompt += "minimal shading, professional fashion design sketch, full body, white background."
+
+        negative_prompt = "blurry, low resolution, extra limbs, bad anatomy, text, watermark, cartoon, painting, unrealistic, photorealistic, deformed, distorted, ugly, pixelated, bad quality"
+        return prompt, negative_prompt
+
+    def generate_sketch(self, prompt, negative_prompt, control_image_bytes=None):
+        
