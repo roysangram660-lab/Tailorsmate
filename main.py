@@ -1,5 +1,3 @@
-# filename: main.py (for your independent Python AI server, e.g., Flask app)
-
 from flask import Flask, request, jsonify
 import os
 import cv2
