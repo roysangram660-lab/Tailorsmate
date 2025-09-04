@@ -1,0 +1,8 @@
+Flask==2.3.3
+supabase-py==0.11.0 # Or the latest stable version
+opencv-python==4.8.1.78
+mediapipe==0.10.9
+numpy==1.26.2
+Pillow==10.1.0
+requests==2.31.0
+tensorflow==2.15.0 # Dependency for MediaPipe
